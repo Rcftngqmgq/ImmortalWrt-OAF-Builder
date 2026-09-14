@@ -3,12 +3,6 @@ name: Build OpenAppFilter for ImmortalWrt x86_64
 on:
   workflow_dispatch:
     inputs:
-      ssh:
-        description: 'SSH connection to Actions'
-        required: false
-        default: false
-        type: boolean
-
       immortalwrt_version:
         description: '选择 ImmortalWrt 源码版本'
         required: true
@@ -24,12 +18,6 @@ on:
           - v25.12.5
           - v25.12.6
 
-      force_rebuild:
-        description: 'Build from scratch'
-        required: false
-        type: boolean
-        default: false
-
 permissions:
   contents: write
 
@@ -39,23 +27,44 @@ env:
 
 jobs:
   build:
+    name: OAF - ${{ inputs.immortalwrt_version }} - x86_64
     runs-on: ubuntu-24.04
 
     steps:
+      # ============================================================
+      # Checkout Builder Repository
+      # ============================================================
+
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ============================================================
+      # Free disk space
+      # ============================================================
+
       - name: Free disk space
+        shell: bash
         run: |
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          set -euxo pipefail
+
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
 
           df -h
 
-      - name: Install dependencies
+      # ============================================================
+      # Build dependencies
+      #
+      # genisoimage provides mkisofs.
+      # ============================================================
+
+      - name: Install build dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -66,11 +75,13 @@ jobs:
             g++ \
             gawk \
             gcc-multilib \
+            g++-multilib \
             gettext \
             git \
             libelf-dev \
             libncurses-dev \
             libssl-dev \
+            zlib1g-dev \
             python3 \
             python3-setuptools \
             python3-pyelftools \
@@ -82,16 +93,90 @@ jobs:
             curl \
             jq \
             zstd \
-            ccache
+            ccache \
+            genisoimage \
+            qemu-utils \
+            dosfstools \
+            mtools \
+            parted
 
-      #
-      # ImmortalWrt:
-      #
-      # openwrt-25.12 = branch
-      # v25.12.x      = tag
-      #
+          echo
+          echo "mkisofs:"
+          command -v mkisofs
+          mkisofs --version || true
+
+      # ============================================================
+      # Validate selected ImmortalWrt branch/tag
+      # ============================================================
+
+      - name: Validate ImmortalWrt ref
+        id: validate_iwrt
+        shell: bash
+        env:
+          IWRT_REF: ${{ inputs.immortalwrt_version }}
+        run: |
+          set -euxo pipefail
+
+          echo "Selected ImmortalWrt ref: ${IWRT_REF}"
+
+          if [[ "${IWRT_REF}" == v* ]]; then
+
+            echo "Checking ImmortalWrt tag: ${IWRT_REF}"
+
+            if ! git ls-remote \
+              --exit-code \
+              --tags \
+              "${IMMORTALWRT_REPO}" \
+              "refs/tags/${IWRT_REF}" \
+              >/dev/null 2>&1; then
+
+              echo
+              echo "============================================================"
+              echo "ERROR: ImmortalWrt tag does not exist:"
+              echo "${IWRT_REF}"
+              echo "============================================================"
+              exit 1
+            fi
+
+            RELEASE="${IWRT_REF#v}"
+
+            echo "type=tag" >> "${GITHUB_OUTPUT}"
+            echo "release=${RELEASE}" >> "${GITHUB_OUTPUT}"
+
+          else
+
+            echo "Checking ImmortalWrt branch: ${IWRT_REF}"
+
+            if ! git ls-remote \
+              --exit-code \
+              --heads \
+              "${IMMORTALWRT_REPO}" \
+              "refs/heads/${IWRT_REF}" \
+              >/dev/null 2>&1; then
+
+              echo
+              echo "============================================================"
+              echo "ERROR: ImmortalWrt branch does not exist:"
+              echo "${IWRT_REF}"
+              echo "============================================================"
+              exit 1
+            fi
+
+            echo "type=branch" >> "${GITHUB_OUTPUT}"
+            echo "release=${IWRT_REF}" >> "${GITHUB_OUTPUT}"
+
+          fi
+
+          echo
+          echo "ImmortalWrt ref is valid."
+
+      # ============================================================
+      # Clone ImmortalWrt
+      # ============================================================
+
       - name: Clone ImmortalWrt
         id: iwrt
+        shell: bash
         env:
           IWRT_REF: ${{ inputs.immortalwrt_version }}
         run: |
@@ -108,81 +193,24 @@ jobs:
           IWRT_COMMIT="$(git rev-parse HEAD)"
           IWRT_SHORT="$(git rev-parse --short=8 HEAD)"
 
-          echo "======================================="
+          echo
+          echo "============================================================"
           echo "ImmortalWrt"
-          echo "======================================="
+          echo "============================================================"
           echo "Ref:    ${IWRT_REF}"
           echo "Commit: ${IWRT_COMMIT}"
-          echo "======================================="
+          echo "============================================================"
 
           echo "ref=${IWRT_REF}" >> "${GITHUB_OUTPUT}"
           echo "commit=${IWRT_COMMIT}" >> "${GITHUB_OUTPUT}"
           echo "short_commit=${IWRT_SHORT}" >> "${GITHUB_OUTPUT}"
 
-          #
-          # 判断是固定 release tag 还是滚动分支
-          #
-          if [[ "${IWRT_REF}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            RELEASE="${BASH_REMATCH[1]}"
+      # ============================================================
+      # Update feeds
+      # ============================================================
 
-            echo "fixed=true" >> "${GITHUB_OUTPUT}"
-            echo "release=${RELEASE}" >> "${GITHUB_OUTPUT}"
-          else
-            echo "fixed=false" >> "${GITHUB_OUTPUT}"
-            echo "release=${IWRT_REF}" >> "${GITHUB_OUTPUT}"
-          fi
-
-      #
-      # 对 v25.12.x 固定 tag：
-      #
-      # 使用对应官方 release 的 config.buildinfo。
-      #
-      # 这样编出的 Kernel ABI 最接近对应官方固件，
-      # 而不是自己随便生成一份 x86 配置。
-      #
-      - name: Load official release config
-        if: steps.iwrt.outputs.fixed == 'true'
-        working-directory: immortalwrt
-        env:
-          RELEASE: ${{ steps.iwrt.outputs.release }}
-        run: |
-          set -euxo pipefail
-
-          CONFIG_URL="https://downloads.immortalwrt.org/releases/${RELEASE}/targets/x86/64/config.buildinfo"
-
-          echo "Download:"
-          echo "${CONFIG_URL}"
-
-          curl \
-            -fL \
-            --retry 5 \
-            --retry-delay 3 \
-            -o .config \
-            "${CONFIG_URL}"
-
-          test -s .config
-
-          echo "Official config loaded."
-
-      #
-      # openwrt-25.12 是滚动分支，没有固定 release config，
-      # 因此建立标准 x86/64 配置。
-      #
-      - name: Configure x86_64 branch
-        if: steps.iwrt.outputs.fixed != 'true'
-        working-directory: immortalwrt
-        run: |
-          set -euxo pipefail
-
-          cat > .config <<'EOF'
-          CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-          CONFIG_TARGET_x86_64_DEVICE_generic=y
-          EOF
-
-          make defconfig
-
-      - name: Update feeds
+      - name: Update and install feeds
+        shell: bash
         working-directory: immortalwrt
         run: |
           set -euxo pipefail
@@ -190,13 +218,56 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      # ============================================================
+      # Remove ImmortalWrt built-in OAF
       #
-      # 不使用 master。
+      # ImmortalWrt packages feed already contains:
       #
-      # 自动读取 OpenAppFilter 最新正式 tag。
+      #   kmod-oaf
+      #   appfilter
       #
+      # It conflicts with destan19/OpenAppFilter and causes:
+      #
+      # recursive dependency detected
+      # symbol PACKAGE_kmod-oaf is selected by PACKAGE_kmod-oaf
+      # ============================================================
+
+      - name: Remove built-in OpenAppFilter
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -euxo pipefail
+
+          echo "Removing ImmortalWrt built-in OpenAppFilter..."
+
+          rm -rf feeds/packages/net/open-app-filter
+          rm -rf package/feeds/packages/open-app-filter
+
+          # Old ImmortalWrt LuCI frontend
+          rm -rf feeds/luci/applications/luci-app-appfilter
+          rm -rf package/feeds/luci/luci-app-appfilter
+
+          # Remove generated package/Kconfig cache
+          rm -rf tmp
+
+          echo
+          echo "Built-in OpenAppFilter removed."
+
+      # ============================================================
+      # Get latest stable OAF tag
+      #
+      # Examples:
+      #
+      # v7.0.1
+      # v7.0.2
+      # v7.1.0
+      #
+      # master / rc / beta tags are not used.
+      # ============================================================
+
       - name: Resolve latest OpenAppFilter tag
         id: oaf
+        shell: bash
         run: |
           set -euxo pipefail
 
@@ -206,25 +277,42 @@ jobs:
               --refs \
               "${OAF_REPO}" \
               'refs/tags/v*' \
-            | awk -F/ '{print $3}' \
+            | sed 's#.*refs/tags/##' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V \
             | tail -n 1
           )"
 
           if [ -z "${OAF_TAG}" ]; then
-            echo "Unable to determine latest OpenAppFilter tag."
+            echo "ERROR: Unable to determine latest OpenAppFilter tag."
             exit 1
           fi
 
-          echo "======================================="
+          if ! git ls-remote \
+            --exit-code \
+            --tags \
+            "${OAF_REPO}" \
+            "refs/tags/${OAF_TAG}" \
+            >/dev/null 2>&1; then
+
+            echo "ERROR: Invalid OpenAppFilter tag: ${OAF_TAG}"
+            exit 1
+          fi
+
+          echo
+          echo "============================================================"
           echo "Latest OpenAppFilter tag: ${OAF_TAG}"
-          echo "======================================="
+          echo "============================================================"
 
           echo "tag=${OAF_TAG}" >> "${GITHUB_OUTPUT}"
 
-      - name: Clone OpenAppFilter latest tag
+      # ============================================================
+      # Clone OAF latest stable tag
+      # ============================================================
+
+      - name: Clone OpenAppFilter
         id: oaf_source
+        shell: bash
         working-directory: immortalwrt
         env:
           OAF_TAG: ${{ steps.oaf.outputs.tag }}
@@ -247,26 +335,186 @@ jobs:
             git -C package/OpenAppFilter rev-parse --short=8 HEAD
           )"
 
+          APPFILTER_VERSION="$(
+            sed -n 's/^PKG_VERSION:=//p' \
+            package/OpenAppFilter/open-app-filter/Makefile \
+            | head -n 1
+          )"
+
           echo
-          echo "======================================="
+          echo "============================================================"
           echo "OpenAppFilter"
-          echo "======================================="
-          echo "Tag:    ${OAF_TAG}"
-          echo "Commit: ${OAF_COMMIT}"
-          echo "======================================="
-          echo
+          echo "============================================================"
+          echo "Tag:               ${OAF_TAG}"
+          echo "AppFilter version: ${APPFILTER_VERSION}"
+          echo "Commit:            ${OAF_COMMIT}"
+          echo "============================================================"
 
           echo "commit=${OAF_COMMIT}" >> "${GITHUB_OUTPUT}"
           echo "short_commit=${OAF_SHORT}" >> "${GITHUB_OUTPUT}"
+          echo "version=${APPFILTER_VERSION}" >> "${GITHUB_OUTPUT}"
 
+      # ============================================================
+      # Check duplicate package definitions
       #
-      # 三个包全部按 module 方式构建。
+      # There must be exactly one KernelPackage/oaf and one
+      # Package/appfilter after removing ImmortalWrt built-in OAF.
+      # ============================================================
+
+      - name: Check OpenAppFilter package conflicts
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "Searching KernelPackage/oaf definitions..."
+          echo
+
+          KMOD_FILES="$(
+            grep -Rsl \
+              --include='Makefile' \
+              'define KernelPackage/oaf' \
+              package feeds \
+              2>/dev/null \
+              || true
+          )"
+
+          printf '%s\n' "${KMOD_FILES}"
+
+          KMOD_COUNT="$(
+            printf '%s\n' "${KMOD_FILES}" \
+              | sed '/^$/d' \
+              | wc -l
+          )"
+
+          echo
+          echo "KernelPackage/oaf definitions: ${KMOD_COUNT}"
+
+          if [ "${KMOD_COUNT}" -ne 1 ]; then
+            echo
+            echo "ERROR: Duplicate or missing KernelPackage/oaf."
+            exit 1
+          fi
+
+          echo
+          echo "Searching Package/appfilter definitions..."
+          echo
+
+          APP_FILES="$(
+            grep -Rsl \
+              --include='Makefile' \
+              'define Package/appfilter' \
+              package feeds \
+              2>/dev/null \
+              || true
+          )"
+
+          printf '%s\n' "${APP_FILES}"
+
+          APP_COUNT="$(
+            printf '%s\n' "${APP_FILES}" \
+              | sed '/^$/d' \
+              | wc -l
+          )"
+
+          echo
+          echo "Package/appfilter definitions: ${APP_COUNT}"
+
+          if [ "${APP_COUNT}" -ne 1 ]; then
+            echo
+            echo "ERROR: Duplicate or missing Package/appfilter."
+            exit 1
+          fi
+
+      # ============================================================
+      # Fixed release tag:
       #
-      - name: Configure OpenAppFilter
+      # Load official x86/64 config.buildinfo.
+      #
+      # This is important for matching the official ImmortalWrt
+      # kernel configuration / ABI as closely as possible.
+      # ============================================================
+
+      - name: Load official x86_64 config
+        if: steps.validate_iwrt.outputs.type == 'tag'
+        shell: bash
+        working-directory: immortalwrt
+        env:
+          RELEASE: ${{ steps.validate_iwrt.outputs.release }}
+        run: |
+          set -euxo pipefail
+
+          CONFIG_URL="https://downloads.immortalwrt.org/releases/${RELEASE}/targets/x86/64/config.buildinfo"
+
+          echo "Downloading official config:"
+          echo "${CONFIG_URL}"
+
+          if ! curl \
+            -fL \
+            --retry 5 \
+            --retry-delay 3 \
+            -o .config \
+            "${CONFIG_URL}"; then
+
+            echo
+            echo "============================================================"
+            echo "ERROR: Official x86/64 config.buildinfo is unavailable."
+            echo
+            echo "ImmortalWrt tag: v${RELEASE}"
+            echo
+            echo "The Git tag may exist before official firmware files"
+            echo "have been published."
+            echo "============================================================"
+            exit 1
+          fi
+
+          test -s .config
+
+      # ============================================================
+      # Rolling branch:
+      #
+      # openwrt-25.12 has no immutable official release config.
+      # Build current branch HEAD as generic x86_64.
+      # ============================================================
+
+      - name: Configure x86_64 branch
+        if: steps.validate_iwrt.outputs.type == 'branch'
+        shell: bash
         working-directory: immortalwrt
         run: |
           set -euxo pipefail
 
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          EOF
+
+      # ============================================================
+      # Enable all three OAF packages
+      #
+      # kmod-oaf
+      # appfilter
+      # luci-app-oaf
+      # ============================================================
+
+      - name: Configure OpenAppFilter
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -euxo pipefail
+
+          #
+          # Remove old OAF selections from official config.
+          #
+          sed -i -E \
+            '/^(# )?CONFIG_PACKAGE_(kmod-oaf|appfilter|luci-app-appfilter|luci-app-oaf)(=| is not set)/d' \
+            .config || true
+
+          #
+          # Enable all three current upstream OAF packages.
+          #
           cat >> .config <<'EOF'
 
           CONFIG_PACKAGE_kmod-oaf=m
@@ -275,210 +523,336 @@ jobs:
           CONFIG_LUCI_LANG_zh_Hans=y
           EOF
 
-          make defconfig
+          #
+          # Force Kconfig/package metadata regeneration.
+          #
+          rm -rf tmp
+
+          make defconfig 2>&1 | tee /tmp/oaf-defconfig.log
+
+          #
+          # make defconfig may print recursive dependency errors
+          # without returning a non-zero status, so explicitly check.
+          #
+          if grep -q "recursive dependency detected" /tmp/oaf-defconfig.log; then
+            echo
+            echo "============================================================"
+            echo "ERROR: recursive Kconfig dependency detected."
+            echo "============================================================"
+            exit 1
+          fi
 
           echo
-          echo "========== OAF CONFIG =========="
-          grep -E '^CONFIG_PACKAGE_(kmod-oaf|appfilter|luci-app-oaf)=' .config
-          echo "================================"
+          echo "================ OAF CONFIG ================="
+          grep -E \
+            '^CONFIG_PACKAGE_(kmod-oaf|appfilter|luci-app-oaf)=' \
+            .config \
+            || true
+          echo "============================================="
           echo
 
-          grep -q '^CONFIG_PACKAGE_kmod-oaf=m' .config
-          grep -q '^CONFIG_PACKAGE_appfilter=m' .config
-          grep -q '^CONFIG_PACKAGE_luci-app-oaf=m' .config
+          grep -Eq '^CONFIG_PACKAGE_kmod-oaf=[my]$' .config
+          grep -Eq '^CONFIG_PACKAGE_appfilter=[my]$' .config
+          grep -Eq '^CONFIG_PACKAGE_luci-app-oaf=[my]$' .config
 
-      - name: Download sources
+      # ============================================================
+      # Show final build information
+      # ============================================================
+
+      - name: Show build configuration
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "============================================================"
+          echo "Build configuration"
+          echo "============================================================"
+
+          grep -E \
+            '^(CONFIG_TARGET_x86|CONFIG_TARGET_x86_64|CONFIG_TARGET_x86_64_DEVICE_generic)=' \
+            .config \
+            || true
+
+          echo
+
+          grep -E \
+            '^CONFIG_PACKAGE_(kmod-oaf|appfilter|luci-app-oaf)=' \
+            .config
+
+          echo "============================================================"
+
+      # ============================================================
+      # Build host tools
+      # ============================================================
+
+      - name: Build tools
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -o pipefail
+
+          make \
+            tools/install \
+            -j"$(nproc)" \
+            V=s \
+            2>&1 | tee "${GITHUB_WORKSPACE}/tools.log"
+
+      # ============================================================
+      # Build toolchain
+      # ============================================================
+
+      - name: Build toolchain
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -o pipefail
+
+          make \
+            toolchain/install \
+            -j"$(nproc)" \
+            V=s \
+            2>&1 | tee "${GITHUB_WORKSPACE}/toolchain.log"
+
+      # ============================================================
+      # Prepare/build kernel
+      #
+      # Required because kmod-oaf produces oaf.ko.
+      # ============================================================
+
+      - name: Build kernel environment
+        shell: bash
+        working-directory: immortalwrt
+        run: |
+          set -o pipefail
+
+          make \
+            target/linux/compile \
+            -j"$(nproc)" \
+            V=s \
+            2>&1 | tee "${GITHUB_WORKSPACE}/kernel.log"
+
+      # ============================================================
+      # Read kernel version and vermagic from actual build
+      # ============================================================
+
+      - name: Detect kernel information
+        id: kernel
+        shell: bash
         working-directory: immortalwrt
         run: |
           set -euxo pipefail
 
-          make download \
-            -j"$(nproc)"
+          VERMAGIC_FILE="$(
+            find build_dir \
+              -type f \
+              -name '.vermagic' \
+              -print \
+              -quit
+          )"
 
-          find dl \
-            -type f \
-            -size -1024c \
-            -delete || true
+          if [ -z "${VERMAGIC_FILE}" ]; then
+            echo "ERROR: Kernel .vermagic file not found."
+            exit 1
+          fi
 
+          KERNEL_VERMAGIC="$(
+            cat "${VERMAGIC_FILE}"
+          )"
+
+          KERNEL_DIR="$(
+            dirname "${VERMAGIC_FILE}"
+          )"
+
+          KERNEL_VERSION="$(
+            basename "${KERNEL_DIR}" \
+            | sed -nE 's/^linux-([0-9]+\.[0-9]+\.[0-9]+.*)$/\1/p'
+          )"
+
+          if [ -z "${KERNEL_VERSION}" ]; then
+
+            KERNEL_VERSION="$(
+              find build_dir \
+                -type d \
+                -name 'linux-[0-9]*' \
+                | sed -nE \
+                  's#^.*/linux-([0-9]+\.[0-9]+\.[0-9]+.*)$#\1#p' \
+                | head -n 1
+            )"
+
+          fi
+
+          echo
+          echo "============================================================"
+          echo "Kernel version : ${KERNEL_VERSION}"
+          echo "Kernel vermagic: ${KERNEL_VERMAGIC}"
+          echo "============================================================"
+
+          echo "version=${KERNEL_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "vermagic=${KERNEL_VERMAGIC}" >> "${GITHUB_OUTPUT}"
+
+      # ============================================================
+      # Build all three OpenAppFilter packages together
       #
-      # kmod-oaf 需要 kernel build environment。
-      #
-      # 所以这里不是仅仅编译 LuCI，
-      # 而是准备完整 toolchain + kernel。
-      #
-      - name: Build tools
-        working-directory: immortalwrt
-        run: |
-          set -o pipefail
+      #   kmod-oaf
+      #   appfilter
+      #   luci-app-oaf
+      # ============================================================
 
-          make tools/install \
-            -j"$(nproc)" \
-            V=s
-
-      - name: Build toolchain
-        working-directory: immortalwrt
-        run: |
-          set -o pipefail
-
-          make toolchain/install \
-            -j"$(nproc)" \
-            V=s
-
-      - name: Build kernel environment
-        working-directory: immortalwrt
-        run: |
-          set -o pipefail
-
-          make target/linux/compile \
-            -j"$(nproc)" \
-            V=s
-
-      - name: SSH connection to Actions
-        if: ${{ inputs.ssh }}
-        uses: mxschmitt/action-tmate@v3
-
-      #
-      # OAF kernel module
-      #
-      - name: Build kmod-oaf
+      - name: Build OpenAppFilter packages
+        shell: bash
         working-directory: immortalwrt
         run: |
           set -o pipefail
 
           make \
             package/OpenAppFilter/oaf/compile \
-            -j"$(nproc)" \
-            V=s \
-            2>&1 | tee "${GITHUB_WORKSPACE}/kmod-oaf.log"
-
-      #
-      # 用户态 daemon
-      #
-      - name: Build appfilter
-        working-directory: immortalwrt
-        run: |
-          set -o pipefail
-
-          make \
             package/OpenAppFilter/open-app-filter/compile \
-            -j"$(nproc)" \
-            V=s \
-            2>&1 | tee "${GITHUB_WORKSPACE}/appfilter.log"
-
-      #
-      # LuCI
-      #
-      - name: Build luci-app-oaf
-        working-directory: immortalwrt
-        run: |
-          set -o pipefail
-
-          make \
             package/OpenAppFilter/luci-app-oaf/compile \
             -j"$(nproc)" \
             V=s \
-            2>&1 | tee "${GITHUB_WORKSPACE}/luci-app-oaf.log"
+            2>&1 | tee "${GITHUB_WORKSPACE}/openappfilter.log"
 
-      #
-      # 从生成的 kernel package 中读取实际依赖，
-      # 不自己猜 kernel ABI。
-      #
-      - name: Collect packages
+      # ============================================================
+      # Collect all generated OAF APK packages
+      # ============================================================
+
+      - name: Collect OpenAppFilter packages
         id: collect
+        shell: bash
         working-directory: immortalwrt
         env:
           IWRT_REF: ${{ steps.iwrt.outputs.ref }}
           IWRT_COMMIT: ${{ steps.iwrt.outputs.short_commit }}
           OAF_TAG: ${{ steps.oaf.outputs.tag }}
           OAF_COMMIT: ${{ steps.oaf_source.outputs.short_commit }}
+          OAF_VERSION: ${{ steps.oaf_source.outputs.version }}
+          KERNEL_VERSION: ${{ steps.kernel.outputs.version }}
+          KERNEL_VERMAGIC: ${{ steps.kernel.outputs.vermagic }}
         run: |
           set -euxo pipefail
 
           OUT="${GITHUB_WORKSPACE}/out"
+          PKG="${OUT}/packages"
 
           rm -rf "${OUT}"
-          mkdir -p "${OUT}/packages"
+          mkdir -p "${PKG}"
 
+          #
+          # 1. kmod-oaf
+          #
           find bin \
             -type f \
-            \( \
-              -name 'kmod-oaf*.apk' \
-              -o -name 'appfilter*.apk' \
-              -o -name 'luci-app-oaf*.apk' \
-              -o -name 'luci-i18n-oaf-*.apk' \
-            \) \
-            -exec cp -v {} "${OUT}/packages/" \;
+            -name 'kmod-oaf*.apk' \
+            -exec cp -v {} "${PKG}/" \;
+
+          #
+          # 2. appfilter
+          #
+          find bin \
+            -type f \
+            -name 'appfilter*.apk' \
+            -exec cp -v {} "${PKG}/" \;
+
+          #
+          # 3. luci-app-oaf
+          #
+          find bin \
+            -type f \
+            -name 'luci-app-oaf*.apk' \
+            -exec cp -v {} "${PKG}/" \;
+
+          #
+          # Optional Chinese translation package
+          #
+          find bin \
+            -type f \
+            -name 'luci-i18n-oaf-*.apk' \
+            -exec cp -v {} "${PKG}/" \;
 
           echo
-          echo "============== Packages =============="
-          ls -lh "${OUT}/packages"
-          echo "======================================"
-          echo
+          echo "============================================================"
+          echo "Generated OpenAppFilter packages"
+          echo "============================================================"
+          ls -lh "${PKG}"
+          echo "============================================================"
 
-          test -n "$(
-            find "${OUT}/packages" \
+          #
+          # Verify all three core packages exist.
+          #
+          KMOD_PACKAGE="$(
+            find "${PKG}" \
+              -maxdepth 1 \
+              -type f \
               -name 'kmod-oaf*.apk' \
               -print \
               -quit
           )"
 
-          test -n "$(
-            find "${OUT}/packages" \
+          APPFILTER_PACKAGE="$(
+            find "${PKG}" \
+              -maxdepth 1 \
+              -type f \
               -name 'appfilter*.apk' \
               -print \
               -quit
           )"
 
-          test -n "$(
-            find "${OUT}/packages" \
+          LUCI_PACKAGE="$(
+            find "${PKG}" \
+              -maxdepth 1 \
+              -type f \
               -name 'luci-app-oaf*.apk' \
               -print \
               -quit
           )"
 
+          if [ -z "${KMOD_PACKAGE}" ]; then
+            echo "ERROR: kmod-oaf APK was not generated."
+            exit 1
+          fi
+
+          if [ -z "${APPFILTER_PACKAGE}" ]; then
+            echo "ERROR: appfilter APK was not generated."
+            exit 1
+          fi
+
+          if [ -z "${LUCI_PACKAGE}" ]; then
+            echo "ERROR: luci-app-oaf APK was not generated."
+            exit 1
+          fi
+
+          #
+          # SHA256
+          #
           (
-            cd "${OUT}/packages"
+            cd "${PKG}"
             sha256sum *.apk > SHA256SUMS
           )
-
-          #
-          # 找 kernel build version
-          #
-          KERNEL_VERSION="$(
-            find build_dir/target-* \
-              -maxdepth 1 \
-              -type d \
-              -name 'linux-*' \
-              2>/dev/null \
-            | sed -nE \
-              's#.*linux-([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' \
-            | head -n 1
-          )"
-
-          if [ -z "${KERNEL_VERSION}" ]; then
-            KERNEL_VERSION="$(
-              grep '^CONFIG_LINUX_' .config \
-              | head -n 1 \
-              || true
-            )"
-          fi
 
           SAFE_IWRT_REF="$(
             printf '%s' "${IWRT_REF}" \
               | tr '/' '-'
           )"
 
-          NAME="immortalwrt-${SAFE_IWRT_REF}-${IWRT_COMMIT}-oaf-${OAF_TAG}-${OAF_COMMIT}-x86_64"
-
-          cat > "${OUT}/packages/BUILD_INFO.txt" <<EOF
-          OpenAppFilter build
-          ========================================
+          #
+          # Build information
+          #
+          cat > "${PKG}/BUILD_INFO.txt" <<EOF
+          OpenAppFilter for ImmortalWrt
+          ============================================================
 
           OpenAppFilter tag:
           ${OAF_TAG}
 
+          OpenAppFilter version:
+          ${OAF_VERSION}
+
           OpenAppFilter commit:
           ${OAF_COMMIT}
+
+          ------------------------------------------------------------
 
           ImmortalWrt ref:
           ${IWRT_REF}
@@ -489,33 +863,83 @@ jobs:
           Target:
           x86/64
 
-          Kernel:
+          ------------------------------------------------------------
+
+          Kernel version:
           ${KERNEL_VERSION}
+
+          Kernel vermagic:
+          ${KERNEL_VERMAGIC}
+
+          ------------------------------------------------------------
+
+          Packages:
+
+          $(basename "${KMOD_PACKAGE}")
+          $(basename "${APPFILTER_PACKAGE}")
+          $(basename "${LUCI_PACKAGE}")
+
+          ------------------------------------------------------------
+
+          Source:
+
+          https://github.com/destan19/OpenAppFilter
+          https://github.com/immortalwrt/immortalwrt
           EOF
 
+          #
+          # Archive name
+          #
+          ARCHIVE_NAME="immortalwrt-${SAFE_IWRT_REF}-oaf-${OAF_TAG}-x86_64-kernel_${KERNEL_VERSION}"
+
           tar \
-            -C "${OUT}/packages" \
-            -czf "${OUT}/${NAME}.tar.gz" \
+            -C "${PKG}" \
+            -czf "${OUT}/${ARCHIVE_NAME}.tar.gz" \
             .
 
-          echo "name=${NAME}" >> "${GITHUB_OUTPUT}"
-          echo "kernel=${KERNEL_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "archive_name=${ARCHIVE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "safe_iwrt_ref=${SAFE_IWRT_REF}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload artifact
+      # ============================================================
+      # Upload GitHub Actions Artifact
+      #
+      # Contains:
+      #
+      # kmod-oaf
+      # appfilter
+      # luci-app-oaf
+      # luci-i18n-oaf-* (if generated)
+      # SHA256SUMS
+      # BUILD_INFO.txt
+      # tar.gz
+      # ============================================================
+
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.collect.outputs.name }}
+          name: ${{ steps.collect.outputs.archive_name }}
           path: |
-            out/packages/*
+            out/packages/*.apk
+            out/packages/SHA256SUMS
+            out/packages/BUILD_INFO.txt
             out/*.tar.gz
           if-no-files-found: error
           retention-days: 30
 
-      - name: Prepare Release
+      # ============================================================
+      # Prepare GitHub Release information
+      #
+      # For openwrt-25.12 branch:
+      # include commit because branch keeps changing.
+      #
+      # For fixed v25.12.x tag:
+      # commit is also retained to make the build reproducible.
+      # ============================================================
+
+      - name: Prepare GitHub Release
         id: release
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
           IWRT_REF: ${{ steps.iwrt.outputs.ref }}
           IWRT_COMMIT: ${{ steps.iwrt.outputs.short_commit }}
           OAF_TAG: ${{ steps.oaf.outputs.tag }}
@@ -527,70 +951,107 @@ jobs:
               | tr '/' '-'
           )"
 
-          #
-          # branch 必须包含 commit，
-          # 否则 openwrt-25.12 每次更新都会撞同一个 tag。
-          #
           TAG="oaf-${OAF_TAG}-immortalwrt-${SAFE_IWRT_REF}-${IWRT_COMMIT}-x86_64"
 
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-
-            if [ "${FORCE_REBUILD}" = "true" ]; then
-
-              gh release delete \
-                "${TAG}" \
-                --yes \
-                --cleanup-tag
-
-              echo "publish=true" >> "${GITHUB_OUTPUT}"
-
-            else
-              echo "Release already exists."
-              echo "publish=false" >> "${GITHUB_OUTPUT}"
-            fi
-
-          else
-            echo "publish=true" >> "${GITHUB_OUTPUT}"
-          fi
+      # ============================================================
+      # Create or update GitHub Release
+      #
+      # Re-running the exact same source/tag updates existing assets
+      # with --clobber instead of needing force_rebuild.
+      # ============================================================
 
       - name: Publish GitHub Release
-        if: steps.release.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release.outputs.tag }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
 
-          name: >-
-            OAF ${{ steps.oaf.outputs.tag }}
-            - ImmortalWrt ${{ steps.iwrt.outputs.ref }}
-            - x86_64
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
 
-          body: |
-            ### OpenAppFilter
+          IWRT_REF: ${{ steps.iwrt.outputs.ref }}
+          IWRT_COMMIT: ${{ steps.iwrt.outputs.commit }}
 
-            Tag: `${{ steps.oaf.outputs.tag }}`
-            Commit: `${{ steps.oaf_source.outputs.commit }}`
+          OAF_TAG: ${{ steps.oaf.outputs.tag }}
+          OAF_COMMIT: ${{ steps.oaf_source.outputs.commit }}
+          OAF_VERSION: ${{ steps.oaf_source.outputs.version }}
 
-            ### ImmortalWrt
+          KERNEL_VERSION: ${{ steps.kernel.outputs.version }}
+          KERNEL_VERMAGIC: ${{ steps.kernel.outputs.vermagic }}
+        run: |
+          set -euxo pipefail
 
-            Ref: `${{ steps.iwrt.outputs.ref }}`
-            Commit: `${{ steps.iwrt.outputs.commit }}`
+          cat > "${GITHUB_WORKSPACE}/release-notes.md" <<EOF
+          ## OpenAppFilter
 
-            Target: `x86/64`
+          - OAF tag: \`${OAF_TAG}\`
+          - OAF version: \`${OAF_VERSION}\`
+          - OAF commit: \`${OAF_COMMIT}\`
 
-            Kernel: `${{ steps.collect.outputs.kernel }}`
+          ## ImmortalWrt
 
-            ---
+          - Source ref: \`${IWRT_REF}\`
+          - Commit: \`${IWRT_COMMIT}\`
+          - Target: \`x86/64\`
 
-            `openwrt-25.12` 为滚动分支，每次构建的 ImmortalWrt commit 可能不同。
+          ## Kernel
 
-            `v25.12.x` 为固定 tag，同一个 tag 对应固定源码。
+          - Version: \`${KERNEL_VERSION}\`
+          - Vermagic: \`${KERNEL_VERMAGIC}\`
 
-            `kmod-oaf` 与 Kernel ABI 强相关，请勿跨不同 Kernel ABI 安装。
+          ## Packages
 
-          files: |
-            out/packages/*.apk
-            out/packages/SHA256SUMS
-            out/packages/BUILD_INFO.txt
-            out/*.tar.gz
+          本 Release 同时包含：
+
+          - \`kmod-oaf\`
+          - \`appfilter\`
+          - \`luci-app-oaf\`
+          - \`luci-i18n-oaf-zh-cn\`（如果上游生成）
+
+          \`kmod-oaf\` 与当前构建使用的 ImmortalWrt Kernel ABI 绑定，
+          请勿安装到 Kernel ABI 不一致的系统。
+
+          ---
+
+          OpenAppFilter source:
+          https://github.com/destan19/OpenAppFilter
+
+          ImmortalWrt source:
+          https://github.com/immortalwrt/immortalwrt
+          EOF
+
+          RELEASE_NAME="OAF ${OAF_TAG} - ImmortalWrt ${IWRT_REF} - x86_64"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+
+            echo "Release already exists. Updating..."
+
+            gh release edit \
+              "${RELEASE_TAG}" \
+              --title "${RELEASE_NAME}" \
+              --notes-file "${GITHUB_WORKSPACE}/release-notes.md"
+
+          else
+
+            echo "Creating new release..."
+
+            gh release create \
+              "${RELEASE_TAG}" \
+              --title "${RELEASE_NAME}" \
+              --notes-file "${GITHUB_WORKSPACE}/release-notes.md"
+
+          fi
+
+          gh release upload \
+            "${RELEASE_TAG}" \
+            out/packages/*.apk \
+            out/packages/SHA256SUMS \
+            out/packages/BUILD_INFO.txt \
+            out/*.tar.gz \
+            --clobber
+
+          echo
+          echo "============================================================"
+          echo "Release published:"
+          echo "${RELEASE_TAG}"
+          echo "============================================================"
