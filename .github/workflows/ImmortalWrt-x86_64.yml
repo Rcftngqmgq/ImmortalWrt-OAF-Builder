@@ -259,7 +259,22 @@ jobs:
       # Update / install feeds
       # ============================================================
 
-      - name: Update and install feeds
+      # ============================================================
+      # Update feeds and remove ImmortalWrt built-in OAF
+      #
+      # Different ImmortalWrt versions may place OAF in:
+      #
+      #   feeds/base/OpenAppFilter
+      #   feeds/packages/net/open-app-filter
+      #
+      # scripts/feeds install may also create links under:
+      #
+      #   package/feeds/
+      #
+      # Remove all built-in copies before cloning upstream OAF.
+      # ============================================================
+
+      - name: Update feeds and remove built-in OpenAppFilter
         shell: bash
         working-directory: immortalwrt
         run: |
@@ -268,38 +283,104 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ============================================================
-      # Remove ImmortalWrt built-in OpenAppFilter
-      #
-      # ImmortalWrt packages feed contains its own:
-      #
-      #   kmod-oaf
-      #   appfilter
-      #
-      # Leaving it together with destan19/OpenAppFilter results in
-      # duplicate package definitions / recursive Kconfig dependencies.
-      # ============================================================
+          echo
+          echo "============================================================"
+          echo "Searching built-in OpenAppFilter packages..."
+          echo "============================================================"
 
-      - name: Remove built-in OpenAppFilter
-        shell: bash
-        working-directory: immortalwrt
-        run: |
-          set -euxo pipefail
+          find feeds package/feeds \
+            \( \
+              -name 'OpenAppFilter' \
+              -o -name 'open-app-filter' \
+              -o -name 'luci-app-appfilter' \
+            \) \
+            -print \
+            2>/dev/null || true
 
-          echo "Removing ImmortalWrt built-in OpenAppFilter..."
+          echo
+          echo "Removing built-in OpenAppFilter..."
+
+          # --------------------------------------------------------
+          # ImmortalWrt 25.12 current base feed
+          # --------------------------------------------------------
+
+          rm -rf feeds/base/OpenAppFilter
+          rm -rf package/feeds/base/OpenAppFilter
+
+          # --------------------------------------------------------
+          # Compatibility with versions using packages feed
+          # --------------------------------------------------------
 
           rm -rf feeds/packages/net/open-app-filter
           rm -rf package/feeds/packages/open-app-filter
 
-          # Remove old ImmortalWrt LuCI frontend if present.
+          # --------------------------------------------------------
+          # Old ImmortalWrt LuCI frontend
+          # --------------------------------------------------------
+
           rm -rf feeds/luci/applications/luci-app-appfilter
           rm -rf package/feeds/luci/luci-app-appfilter
 
-          # Remove generated package metadata cache.
+          # --------------------------------------------------------
+          # Generic cleanup for future ImmortalWrt layout changes
+          # --------------------------------------------------------
+
+          while IFS= read -r -d '' path; do
+            echo "Removing: ${path}"
+            rm -rf "${path}"
+          done < <(
+            find package/feeds \
+              \( \
+                -name 'OpenAppFilter' \
+                -o -name 'open-app-filter' \
+                -o -name 'luci-app-appfilter' \
+              \) \
+              -print0 \
+              2>/dev/null || true
+          )
+
+          while IFS= read -r -d '' path; do
+            echo "Removing: ${path}"
+            rm -rf "${path}"
+          done < <(
+            find feeds \
+              -type d \
+              \( \
+                -name 'OpenAppFilter' \
+                -o -name 'open-app-filter' \
+                -o -name 'luci-app-appfilter' \
+              \) \
+              -print0 \
+              2>/dev/null || true
+          )
+
+          # Package/Kconfig cache must be regenerated.
           rm -rf tmp
 
           echo
-          echo "Built-in OpenAppFilter removed."
+          echo "============================================================"
+          echo "Checking that built-in OAF has been removed..."
+          echo "============================================================"
+
+          REMAINING="$(
+            find feeds package/feeds \
+              \( \
+                -name 'OpenAppFilter' \
+                -o -name 'open-app-filter' \
+                -o -name 'luci-app-appfilter' \
+              \) \
+              -print \
+              2>/dev/null || true
+          )"
+
+          if [ -n "${REMAINING}" ]; then
+            echo "${REMAINING}"
+            echo
+            echo "ERROR: Built-in OpenAppFilter still exists."
+            exit 1
+          fi
+
+          echo "Built-in OpenAppFilter removed successfully."
 
       # ============================================================
       # Resolve latest stable OpenAppFilter tag
