@@ -12,7 +12,7 @@ on:
       immortalwrt_version:
         description: '选择 ImmortalWrt 源码版本'
         required: true
-        default: 'openwrt-25.12'
+        default: 'v25.12.2'
         type: choice
         options:
           - openwrt-25.12
